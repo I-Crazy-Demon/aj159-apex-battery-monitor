@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller
+build/
+dist/
+*.spec
+*.exe
+
+# OS / editors
+.vscode/
+.idea/
+*.swp
+Thumbs.db
