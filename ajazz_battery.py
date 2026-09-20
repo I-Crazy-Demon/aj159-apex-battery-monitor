@@ -37,8 +37,11 @@ https://qmk.top через браузерный WebHID API (см. README.md, р�
          byte[12]=час(24ч), byte[13]=минута, byte[14]=секунда,
          остальное 0x00. Ответа устройство не даёт.
 
-Команда "очистить экран" (0xac): единственная известная доп. команда,
-    в этой версии не используется (см. README.md, почему).
+Команда "очистить экран" (0xac), перехват qmk.top от 2026-09-20:
+    Feature Report ID 0, 64 байта полезной нагрузки:
+    byte[0]=0xac, byte[7]=0x53, остальные байты нулевые.
+    Вызывается вручную из меню трея для удаления картинки с экрана.
+    Успешная отправка не подтверждает визуальное состояние экрана.
 
 ВАЖНО: экран докстанции в простое (без движения мыши >20 сек)
 принудительно показывает статус радиосвязи (крестик/кружок) поверх
@@ -95,6 +98,7 @@ USAGE_PAGE_VENDOR = 0xFFFF
 
 CMD_STATUS = 0xF7
 CMD_SET_TIME = 0x28
+CMD_CLEAR_SCREEN = 0xAC
 
 REPORT_SIZE = 64          # размер полезной нагрузки HID Feature Report
 WINDOWS_REPORT_ID_PAD = 1  # доп. байт report-id, который добавляет hidapi на Windows
@@ -105,6 +109,15 @@ COLOR_YELLOW = (230, 180, 40, 255)   # 49-15%
 COLOR_RED = (220, 50, 50, 255)       # 14-0% (ниже 5% -- мигает)
 COLOR_GRAY = (110, 110, 110, 255)    # нет данных
 BLINK_THRESHOLD = 5
+
+# Контроль выхода Windows из сна/гибернации. Поток наблюдения просыпается
+# каждые 5 секунд; пауза в 15+ секунд означает, что выполнение программы
+# было приостановлено. После этого выполняются 10 попыток с паузами
+# по 3 секунды; длительность HID-вызовов добавляется ко времени ожидания.
+RESUME_CHECK_INTERVAL = 5
+RESUME_GAP_THRESHOLD = 15
+RESUME_SYNC_RETRY_INTERVAL = 3
+RESUME_SYNC_RETRIES = 10
 
 FONT_CANDIDATES = [
     r"C:\Windows\Fonts\seguisb.ttf",   # Segoe UI Semibold
@@ -166,6 +179,19 @@ def build_time_sync_packet(dt=None):
     return bytes(packet)
 
 
+def build_clear_screen_packet():
+    """Точный пакет очистки из перехвата WebHID от 2026-09-20."""
+    packet = bytearray(REPORT_SIZE)
+    packet[0] = CMD_CLEAR_SCREEN
+    packet[7] = 0x53
+    return bytes(packet)
+
+
+def send_clear_screen(h):
+    """Отправляет очистку картинки; результат проверяется на экране."""
+    send_feature(h, build_clear_screen_packet())
+
+
 def send_feature(h, payload):
     """Отправляет Feature Report с учётом report-id байта, который
     требует hidapi на Windows."""
@@ -192,8 +218,8 @@ def read_status(h):
         return None, None, resp
 
     # resp[0] -- эхо report-id (0x00) на Windows, дальше идут байты устройства.
-    percent = resp[3] if len(resp) > 3 else None
-    unknown_byte = resp[4] if len(resp) > 4 else None
+    percent = resp[3] if resp[3] <= 100 else None
+    unknown_byte = resp[4]
     return percent, unknown_byte, resp
 
 
@@ -254,8 +280,10 @@ def cmd_check():
     print(f"Открыт интерфейс: path={info['path'].decode(errors='replace')}, "
           f"interface_number={info.get('interface_number')}")
 
-    percent, unknown_byte, raw = read_status(h)
-    h.close()
+    try:
+        percent, unknown_byte, raw = read_status(h)
+    finally:
+        h.close()
 
     hex_str = ' '.join(f'{b:02x}' for b in raw)
     print(f"\nСырой ответ: {hex_str}")
@@ -275,8 +303,10 @@ def cmd_sync_time():
     hid_module = _import_hid()
     print("Ищу и открываю рабочий интерфейс...")
     h, info = open_working_device(hid_module)
-    now = send_time_sync(h)
-    h.close()
+    try:
+        now = send_time_sync(h)
+    finally:
+        h.close()
     print(f"Отправлена команда установки времени: "
           f"{now.strftime('%Y-%m-%d %H:%M:%S')}")
     print("\nПроверьте визуально на экранчике докстанции, что дата и время "
@@ -375,12 +405,14 @@ def make_battery_icon(percent, blink_on=True):
 class TrayMonitor:
     """Фоновый монитор заряда и часов докстанции с иконкой в трее.
 
-    Три независимых потока:
+    Четыре независимых потока:
       - poll: периодически опрашивает заряд через HID, обновляет иконку
       - blink: перерисовывает иконку раз в 0.8с при критическом заряде
                (без обращений к HID -- только по уже известному значению)
       - sync: синхронизирует часы докстанции сразу при старте и затем
               периодически
+      - resume: обнаруживает пробуждение Windows и повторно синхронизирует
+                время после появления USB-докстанции
     """
 
     def __init__(self, hid_module, interval, threshold, sync_interval):
@@ -390,6 +422,10 @@ class TrayMonitor:
         self.sync_interval = sync_interval
 
         self.state_lock = threading.Lock()
+        # hidapi и само устройство не рассчитаны на параллельные команды.
+        # Общая блокировка сериализует опрос, синхронизацию и ручные действия.
+        self.hid_lock = threading.Lock()
+        self.manual_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.percent = None
         self.last_error = None
@@ -408,6 +444,8 @@ class TrayMonitor:
     # -- вспомогательное -----------------------------------------------
 
     def _notify(self, title, message):
+        if self.stop_event.is_set():
+            return
         print(f"[УВЕДОМЛЕНИЕ] {title}: {message}")
         if self._plyer is not None:
             try:
@@ -417,6 +455,8 @@ class TrayMonitor:
                 print(f"Не удалось показать toast-уведомление: {e}")
 
     def _refresh_icon(self):
+        if self.stop_event.is_set():
+            return
         with self.state_lock:
             p = self.percent
         self.icon.icon = make_battery_icon(p, blink_on=True)
@@ -427,32 +467,41 @@ class TrayMonitor:
 
     def _poll_once(self):
         try:
-            h, _ = open_working_device(self.hid_module)
-            percent, _, _ = read_status(h)
-            h.close()
+            with self.hid_lock:
+                if self.stop_event.is_set():
+                    return
+                h = None
+                try:
+                    h, _ = open_working_device(self.hid_module)
+                    percent, _, _ = read_status(h)
+                    if percent is None:
+                        raise RuntimeError("Нераспознанный ответ статуса")
+                finally:
+                    if h is not None:
+                        h.close()
             with self.state_lock:
                 self.percent = percent
                 self.last_error = None
         except Exception as e:
             with self.state_lock:
                 self.last_error = str(e)
+                self.percent = None
+            self._refresh_icon()
             print(f"Ошибка опроса: {e}")
             return
 
         self._refresh_icon()
 
         with self.state_lock:
-            p, alerted = self.percent, self.alerted
-
-        if p is not None:
-            if p <= self.threshold and not alerted:
-                self._notify("Низкий заряд мыши",
-                              f"AJ159 APEX: осталось {p}%. Пора на зарядку.")
-                with self.state_lock:
-                    self.alerted = True
-            elif p > self.threshold + 5:
-                with self.state_lock:
-                    self.alerted = False
+            p = self.percent
+            notify = p is not None and p <= self.threshold and not self.alerted
+            if notify:
+                self.alerted = True
+            elif p is not None and p > self.threshold + 5:
+                self.alerted = False
+        if notify:
+            self._notify("Низкий заряд мыши",
+                         f"AJ159 APEX: осталось {p}%. Пора на зарядку.")
 
     def _poll_loop(self):
         while not self.stop_event.is_set():
@@ -475,13 +524,22 @@ class TrayMonitor:
 
     def _do_sync_time(self):
         try:
-            h, _ = open_working_device(self.hid_module)
-            now = send_time_sync(h)
-            h.close()
+            with self.hid_lock:
+                if self.stop_event.is_set():
+                    return
+                h = None
+                try:
+                    h, _ = open_working_device(self.hid_module)
+                    now = send_time_sync(h)
+                finally:
+                    if h is not None:
+                        h.close()
             print(f"Время докстанции синхронизировано: "
                   f"{now.strftime('%Y-%m-%d %H:%M:%S')}")
+            return True
         except Exception as e:
             print(f"Не удалось синхронизировать время: {e}")
+            return False
 
     def _sync_time_loop(self):
         self._do_sync_time()  # сразу при старте
@@ -490,10 +548,65 @@ class TrayMonitor:
             if not self.stop_event.is_set():
                 self._do_sync_time()
 
+    def _sync_after_resume(self):
+        """После пробуждения повторяет синхронизацию, пока USB-докстанция
+        заново определяется Windows. До 10 попыток, между ними 3 секунды ожидания;
+        длительность HID-вызовов добавляется к этому времени."""
+        for attempt in range(1, RESUME_SYNC_RETRIES + 1):
+            if self.stop_event.is_set():
+                return
+            if self._do_sync_time():
+                print("Время повторно синхронизировано после выхода из сна.")
+                return
+            if attempt < RESUME_SYNC_RETRIES:
+                if self.stop_event.wait(RESUME_SYNC_RETRY_INTERVAL):
+                    return
+        print("Докстанция не появилась после выхода из сна; "
+              "синхронизация будет повторена по обычному расписанию.")
+
+    def _resume_watch_loop(self):
+        """Обнаруживает длительную приостановку процесса.
+
+        На Windows time.monotonic() продолжает учитывать время сна, а поток
+        программы в это время не выполняется. Поэтому большой разрыв между
+        двумя проверками надёжно указывает на сон/гибернацию. Ложное
+        срабатывание из-за сильной нагрузки безопасно: оно лишь повторно
+        установит правильное время.
+        """
+        last_check = time.monotonic()
+        while not self.stop_event.wait(RESUME_CHECK_INTERVAL):
+            now = time.monotonic()
+            gap = now - last_check
+            last_check = now
+            if gap >= RESUME_GAP_THRESHOLD:
+                print(f"Обнаружено возобновление работы после паузы "
+                      f"{gap:.0f} сек.")
+                self._sync_after_resume()
+                # Не считать время, потраченное на повторы, новой паузой.
+                last_check = time.monotonic()
+
     # -- меню трея ---------------------------------------------------
 
+    def _start_manual(self, action):
+        """Не блокировать меню на USB и не накапливать ручные команды."""
+        if self.stop_event.is_set() or not self.manual_lock.acquire(False):
+            return
+        def worker():
+            try:
+                if not self.stop_event.is_set():
+                    action()
+            except Exception as e:
+                print(f"Ошибка ручной операции: {e}")
+            finally:
+                self.manual_lock.release()
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            self.manual_lock.release()
+            raise
+
     def _on_refresh(self, icon, item):
-        self._poll_once()
+        self._start_manual(self._poll_once)
 
     def _on_show_exact(self, icon, item):
         with self.state_lock:
@@ -504,8 +617,37 @@ class TrayMonitor:
             self._notify("AJ159 APEX", f"Данные недоступны. {err or ''}")
 
     def _on_sync_time_now(self, icon, item):
-        self._do_sync_time()
-        self._notify("AJ159 APEX", "Время докстанции синхронизировано.")
+        self._start_manual(self._sync_time_manual)
+
+    def _sync_time_manual(self):
+        if self._do_sync_time():
+            self._notify("AJ159 APEX", "Время докстанции синхронизировано.")
+        else:
+            self._notify("AJ159 APEX",
+                         "Не удалось синхронизировать время докстанции.")
+
+    def _on_clear_screen(self, icon, item):
+        self._start_manual(self._clear_screen_manual)
+
+    def _clear_screen_manual(self):
+        try:
+            with self.hid_lock:
+                if self.stop_event.is_set():
+                    return
+                h = None
+                try:
+                    h, _ = open_working_device(self.hid_module)
+                    send_clear_screen(h)
+                finally:
+                    if h is not None:
+                        h.close()
+        except Exception as e:
+            print(f"Не удалось очистить экран докстанции: {e}")
+            self._notify("AJ159 APEX",
+                         "Не удалось отправить команду очистки экрана.")
+            return
+        self._notify("AJ159 APEX",
+                     "Команда очистки отправлена. Появление часов может занять около 35 секунд.")
 
     def _on_quit(self, icon, item):
         self.stop_event.set()
@@ -520,7 +662,8 @@ class TrayMonitor:
         внешне это выглядело как застрявший '?' до первого ручного
         обновления или до истечения полного --interval."""
         icon.visible = True
-        for target in (self._poll_loop, self._blink_loop, self._sync_time_loop):
+        for target in (self._poll_loop, self._blink_loop,
+                       self._sync_time_loop, self._resume_watch_loop):
             threading.Thread(target=target, daemon=True).start()
 
     def run(self):
@@ -535,6 +678,8 @@ class TrayMonitor:
                 pystray.MenuItem("Показать точный заряд", self._on_show_exact),
                 pystray.MenuItem("Синхронизировать время докстанции",
                                   self._on_sync_time_now),
+                pystray.MenuItem("Очистить экран докстанции",
+                                  self._on_clear_screen),
                 pystray.MenuItem("Выход", self._on_quit),
             )
         )
@@ -655,6 +800,11 @@ def main(argv=None):
                  '(по умолчанию 3600 = раз в час)')
 
         args = parser.parse_args(argv)
+        if args.command == 'monitor':
+            if args.interval <= 0 or args.sync_interval <= 0:
+                parser.error("Интервалы должны быть положительными")
+            if not 0 <= args.threshold <= 100:
+                parser.error("Порог должен быть в пределах 0-100")
 
         if args.command == 'check':
             cmd_check()
