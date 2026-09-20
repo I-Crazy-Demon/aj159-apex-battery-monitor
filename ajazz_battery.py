@@ -106,6 +106,15 @@ COLOR_RED = (220, 50, 50, 255)       # 14-0% (ниже 5% -- мигает)
 COLOR_GRAY = (110, 110, 110, 255)    # нет данных
 BLINK_THRESHOLD = 5
 
+# Контроль выхода Windows из сна/гибернации. Поток наблюдения просыпается
+# каждые 5 секунд; пауза в 15+ секунд означает, что выполнение программы
+# было приостановлено. После этого USB-устройству даётся до 30 секунд на
+# повторное появление в системе.
+RESUME_CHECK_INTERVAL = 5
+RESUME_GAP_THRESHOLD = 15
+RESUME_SYNC_RETRY_INTERVAL = 3
+RESUME_SYNC_RETRIES = 10
+
 FONT_CANDIDATES = [
     r"C:\Windows\Fonts\seguisb.ttf",   # Segoe UI Semibold
     r"C:\Windows\Fonts\segoeuib.ttf",  # Segoe UI Bold
@@ -375,12 +384,14 @@ def make_battery_icon(percent, blink_on=True):
 class TrayMonitor:
     """Фоновый монитор заряда и часов докстанции с иконкой в трее.
 
-    Три независимых потока:
+    Четыре независимых потока:
       - poll: периодически опрашивает заряд через HID, обновляет иконку
       - blink: перерисовывает иконку раз в 0.8с при критическом заряде
                (без обращений к HID -- только по уже известному значению)
       - sync: синхронизирует часы докстанции сразу при старте и затем
               периодически
+      - resume: обнаруживает пробуждение Windows и повторно синхронизирует
+                время после появления USB-докстанции
     """
 
     def __init__(self, hid_module, interval, threshold, sync_interval):
@@ -390,6 +401,9 @@ class TrayMonitor:
         self.sync_interval = sync_interval
 
         self.state_lock = threading.Lock()
+        # hidapi и само устройство не рассчитаны на параллельные команды.
+        # Общая блокировка сериализует опрос, синхронизацию и ручные действия.
+        self.hid_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.percent = None
         self.last_error = None
@@ -427,9 +441,14 @@ class TrayMonitor:
 
     def _poll_once(self):
         try:
-            h, _ = open_working_device(self.hid_module)
-            percent, _, _ = read_status(h)
-            h.close()
+            with self.hid_lock:
+                h = None
+                try:
+                    h, _ = open_working_device(self.hid_module)
+                    percent, _, _ = read_status(h)
+                finally:
+                    if h is not None:
+                        h.close()
             with self.state_lock:
                 self.percent = percent
                 self.last_error = None
@@ -475,13 +494,20 @@ class TrayMonitor:
 
     def _do_sync_time(self):
         try:
-            h, _ = open_working_device(self.hid_module)
-            now = send_time_sync(h)
-            h.close()
+            with self.hid_lock:
+                h = None
+                try:
+                    h, _ = open_working_device(self.hid_module)
+                    now = send_time_sync(h)
+                finally:
+                    if h is not None:
+                        h.close()
             print(f"Время докстанции синхронизировано: "
                   f"{now.strftime('%Y-%m-%d %H:%M:%S')}")
+            return True
         except Exception as e:
             print(f"Не удалось синхронизировать время: {e}")
+            return False
 
     def _sync_time_loop(self):
         self._do_sync_time()  # сразу при старте
@@ -489,6 +515,43 @@ class TrayMonitor:
             self.stop_event.wait(self.sync_interval)
             if not self.stop_event.is_set():
                 self._do_sync_time()
+
+    def _sync_after_resume(self):
+        """После пробуждения повторяет синхронизацию, пока USB-докстанция
+        заново определяется Windows. Общая продолжительность ожидания --
+        до 30 секунд."""
+        for attempt in range(1, RESUME_SYNC_RETRIES + 1):
+            if self.stop_event.is_set():
+                return
+            if self._do_sync_time():
+                print("Время повторно синхронизировано после выхода из сна.")
+                return
+            if attempt < RESUME_SYNC_RETRIES:
+                if self.stop_event.wait(RESUME_SYNC_RETRY_INTERVAL):
+                    return
+        print("Докстанция не появилась после выхода из сна; "
+              "синхронизация будет повторена по обычному расписанию.")
+
+    def _resume_watch_loop(self):
+        """Обнаруживает длительную приостановку процесса.
+
+        На Windows time.monotonic() продолжает учитывать время сна, а поток
+        программы в это время не выполняется. Поэтому большой разрыв между
+        двумя проверками надёжно указывает на сон/гибернацию. Ложное
+        срабатывание из-за сильной нагрузки безопасно: оно лишь повторно
+        установит правильное время.
+        """
+        last_check = time.monotonic()
+        while not self.stop_event.wait(RESUME_CHECK_INTERVAL):
+            now = time.monotonic()
+            gap = now - last_check
+            last_check = now
+            if gap >= RESUME_GAP_THRESHOLD:
+                print(f"Обнаружено возобновление работы после паузы "
+                      f"{gap:.0f} сек.")
+                self._sync_after_resume()
+                # Не считать время, потраченное на повторы, новой паузой.
+                last_check = time.monotonic()
 
     # -- меню трея ---------------------------------------------------
 
@@ -504,8 +567,11 @@ class TrayMonitor:
             self._notify("AJ159 APEX", f"Данные недоступны. {err or ''}")
 
     def _on_sync_time_now(self, icon, item):
-        self._do_sync_time()
-        self._notify("AJ159 APEX", "Время докстанции синхронизировано.")
+        if self._do_sync_time():
+            self._notify("AJ159 APEX", "Время докстанции синхронизировано.")
+        else:
+            self._notify("AJ159 APEX",
+                         "Не удалось синхронизировать время докстанции.")
 
     def _on_quit(self, icon, item):
         self.stop_event.set()
@@ -520,7 +586,8 @@ class TrayMonitor:
         внешне это выглядело как застрявший '?' до первого ручного
         обновления или до истечения полного --interval."""
         icon.visible = True
-        for target in (self._poll_loop, self._blink_loop, self._sync_time_loop):
+        for target in (self._poll_loop, self._blink_loop,
+                       self._sync_time_loop, self._resume_watch_loop):
             threading.Thread(target=target, daemon=True).start()
 
     def run(self):
