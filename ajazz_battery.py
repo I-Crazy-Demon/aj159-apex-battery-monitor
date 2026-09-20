@@ -112,8 +112,8 @@ BLINK_THRESHOLD = 5
 
 # Контроль выхода Windows из сна/гибернации. Поток наблюдения просыпается
 # каждые 5 секунд; пауза в 15+ секунд означает, что выполнение программы
-# было приостановлено. После этого USB-устройству даётся до 30 секунд на
-# повторное появление в системе.
+# было приостановлено. После этого выполняются 10 попыток с паузами
+# по 3 секунды; длительность HID-вызовов добавляется ко времени ожидания.
 RESUME_CHECK_INTERVAL = 5
 RESUME_GAP_THRESHOLD = 15
 RESUME_SYNC_RETRY_INTERVAL = 3
@@ -218,8 +218,8 @@ def read_status(h):
         return None, None, resp
 
     # resp[0] -- эхо report-id (0x00) на Windows, дальше идут байты устройства.
-    percent = resp[3] if len(resp) > 3 else None
-    unknown_byte = resp[4] if len(resp) > 4 else None
+    percent = resp[3] if resp[3] <= 100 else None
+    unknown_byte = resp[4]
     return percent, unknown_byte, resp
 
 
@@ -280,8 +280,10 @@ def cmd_check():
     print(f"Открыт интерфейс: path={info['path'].decode(errors='replace')}, "
           f"interface_number={info.get('interface_number')}")
 
-    percent, unknown_byte, raw = read_status(h)
-    h.close()
+    try:
+        percent, unknown_byte, raw = read_status(h)
+    finally:
+        h.close()
 
     hex_str = ' '.join(f'{b:02x}' for b in raw)
     print(f"\nСырой ответ: {hex_str}")
@@ -301,8 +303,10 @@ def cmd_sync_time():
     hid_module = _import_hid()
     print("Ищу и открываю рабочий интерфейс...")
     h, info = open_working_device(hid_module)
-    now = send_time_sync(h)
-    h.close()
+    try:
+        now = send_time_sync(h)
+    finally:
+        h.close()
     print(f"Отправлена команда установки времени: "
           f"{now.strftime('%Y-%m-%d %H:%M:%S')}")
     print("\nПроверьте визуально на экранчике докстанции, что дата и время "
@@ -421,6 +425,7 @@ class TrayMonitor:
         # hidapi и само устройство не рассчитаны на параллельные команды.
         # Общая блокировка сериализует опрос, синхронизацию и ручные действия.
         self.hid_lock = threading.Lock()
+        self.manual_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.percent = None
         self.last_error = None
@@ -439,6 +444,8 @@ class TrayMonitor:
     # -- вспомогательное -----------------------------------------------
 
     def _notify(self, title, message):
+        if self.stop_event.is_set():
+            return
         print(f"[УВЕДОМЛЕНИЕ] {title}: {message}")
         if self._plyer is not None:
             try:
@@ -448,6 +455,8 @@ class TrayMonitor:
                 print(f"Не удалось показать toast-уведомление: {e}")
 
     def _refresh_icon(self):
+        if self.stop_event.is_set():
+            return
         with self.state_lock:
             p = self.percent
         self.icon.icon = make_battery_icon(p, blink_on=True)
@@ -459,10 +468,14 @@ class TrayMonitor:
     def _poll_once(self):
         try:
             with self.hid_lock:
+                if self.stop_event.is_set():
+                    return
                 h = None
                 try:
                     h, _ = open_working_device(self.hid_module)
                     percent, _, _ = read_status(h)
+                    if percent is None:
+                        raise RuntimeError("Нераспознанный ответ статуса")
                 finally:
                     if h is not None:
                         h.close()
@@ -472,23 +485,23 @@ class TrayMonitor:
         except Exception as e:
             with self.state_lock:
                 self.last_error = str(e)
+                self.percent = None
+            self._refresh_icon()
             print(f"Ошибка опроса: {e}")
             return
 
         self._refresh_icon()
 
         with self.state_lock:
-            p, alerted = self.percent, self.alerted
-
-        if p is not None:
-            if p <= self.threshold and not alerted:
-                self._notify("Низкий заряд мыши",
-                              f"AJ159 APEX: осталось {p}%. Пора на зарядку.")
-                with self.state_lock:
-                    self.alerted = True
-            elif p > self.threshold + 5:
-                with self.state_lock:
-                    self.alerted = False
+            p = self.percent
+            notify = p is not None and p <= self.threshold and not self.alerted
+            if notify:
+                self.alerted = True
+            elif p is not None and p > self.threshold + 5:
+                self.alerted = False
+        if notify:
+            self._notify("Низкий заряд мыши",
+                         f"AJ159 APEX: осталось {p}%. Пора на зарядку.")
 
     def _poll_loop(self):
         while not self.stop_event.is_set():
@@ -512,6 +525,8 @@ class TrayMonitor:
     def _do_sync_time(self):
         try:
             with self.hid_lock:
+                if self.stop_event.is_set():
+                    return
                 h = None
                 try:
                     h, _ = open_working_device(self.hid_module)
@@ -535,8 +550,8 @@ class TrayMonitor:
 
     def _sync_after_resume(self):
         """После пробуждения повторяет синхронизацию, пока USB-докстанция
-        заново определяется Windows. Общая продолжительность ожидания --
-        до 30 секунд."""
+        заново определяется Windows. До 10 попыток, между ними 3 секунды ожидания;
+        длительность HID-вызовов добавляется к этому времени."""
         for attempt in range(1, RESUME_SYNC_RETRIES + 1):
             if self.stop_event.is_set():
                 return
@@ -572,8 +587,26 @@ class TrayMonitor:
 
     # -- меню трея ---------------------------------------------------
 
+    def _start_manual(self, action):
+        """Не блокировать меню на USB и не накапливать ручные команды."""
+        if self.stop_event.is_set() or not self.manual_lock.acquire(False):
+            return
+        def worker():
+            try:
+                if not self.stop_event.is_set():
+                    action()
+            except Exception as e:
+                print(f"Ошибка ручной операции: {e}")
+            finally:
+                self.manual_lock.release()
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            self.manual_lock.release()
+            raise
+
     def _on_refresh(self, icon, item):
-        self._poll_once()
+        self._start_manual(self._poll_once)
 
     def _on_show_exact(self, icon, item):
         with self.state_lock:
@@ -584,6 +617,9 @@ class TrayMonitor:
             self._notify("AJ159 APEX", f"Данные недоступны. {err or ''}")
 
     def _on_sync_time_now(self, icon, item):
+        self._start_manual(self._sync_time_manual)
+
+    def _sync_time_manual(self):
         if self._do_sync_time():
             self._notify("AJ159 APEX", "Время докстанции синхронизировано.")
         else:
@@ -591,8 +627,13 @@ class TrayMonitor:
                          "Не удалось синхронизировать время докстанции.")
 
     def _on_clear_screen(self, icon, item):
+        self._start_manual(self._clear_screen_manual)
+
+    def _clear_screen_manual(self):
         try:
             with self.hid_lock:
+                if self.stop_event.is_set():
+                    return
                 h = None
                 try:
                     h, _ = open_working_device(self.hid_module)
@@ -606,7 +647,7 @@ class TrayMonitor:
                          "Не удалось отправить команду очистки экрана.")
             return
         self._notify("AJ159 APEX",
-                     "Команда очистки отправлена. Проверьте экран докстанции.")
+                     "Команда очистки отправлена. Появление часов может занять около 35 секунд.")
 
     def _on_quit(self, icon, item):
         self.stop_event.set()
@@ -759,6 +800,11 @@ def main(argv=None):
                  '(по умолчанию 3600 = раз в час)')
 
         args = parser.parse_args(argv)
+        if args.command == 'monitor':
+            if args.interval <= 0 or args.sync_interval <= 0:
+                parser.error("Интервалы должны быть положительными")
+            if not 0 <= args.threshold <= 100:
+                parser.error("Порог должен быть в пределах 0-100")
 
         if args.command == 'check':
             cmd_check()
