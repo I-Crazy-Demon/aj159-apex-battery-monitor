@@ -37,8 +37,11 @@ https://qmk.top через браузерный WebHID API (см. README.md, р�
          byte[12]=час(24ч), byte[13]=минута, byte[14]=секунда,
          остальное 0x00. Ответа устройство не даёт.
 
-Команда "очистить экран" (0xac): единственная известная доп. команда,
-    в этой версии не используется (см. README.md, почему).
+Команда "очистить экран" (0xac), перехват qmk.top от 2026-09-20:
+    Feature Report ID 0, 64 байта полезной нагрузки:
+    byte[0]=0xac, byte[7]=0x53, остальные байты нулевые.
+    Вызывается вручную из меню трея для удаления картинки с экрана.
+    Успешная отправка не подтверждает визуальное состояние экрана.
 
 ВАЖНО: экран докстанции в простое (без движения мыши >20 сек)
 принудительно показывает статус радиосвязи (крестик/кружок) поверх
@@ -95,6 +98,7 @@ USAGE_PAGE_VENDOR = 0xFFFF
 
 CMD_STATUS = 0xF7
 CMD_SET_TIME = 0x28
+CMD_CLEAR_SCREEN = 0xAC
 
 REPORT_SIZE = 64          # размер полезной нагрузки HID Feature Report
 WINDOWS_REPORT_ID_PAD = 1  # доп. байт report-id, который добавляет hidapi на Windows
@@ -173,6 +177,19 @@ def build_time_sync_packet(dt=None):
     packet[13] = dt.minute
     packet[14] = dt.second
     return bytes(packet)
+
+
+def build_clear_screen_packet():
+    """Точный пакет очистки из перехвата WebHID от 2026-09-20."""
+    packet = bytearray(REPORT_SIZE)
+    packet[0] = CMD_CLEAR_SCREEN
+    packet[7] = 0x53
+    return bytes(packet)
+
+
+def send_clear_screen(h):
+    """Отправляет очистку картинки; результат проверяется на экране."""
+    send_feature(h, build_clear_screen_packet())
 
 
 def send_feature(h, payload):
@@ -573,6 +590,24 @@ class TrayMonitor:
             self._notify("AJ159 APEX",
                          "Не удалось синхронизировать время докстанции.")
 
+    def _on_clear_screen(self, icon, item):
+        try:
+            with self.hid_lock:
+                h = None
+                try:
+                    h, _ = open_working_device(self.hid_module)
+                    send_clear_screen(h)
+                finally:
+                    if h is not None:
+                        h.close()
+        except Exception as e:
+            print(f"Не удалось очистить экран докстанции: {e}")
+            self._notify("AJ159 APEX",
+                         "Не удалось отправить команду очистки экрана.")
+            return
+        self._notify("AJ159 APEX",
+                     "Команда очистки отправлена. Проверьте экран докстанции.")
+
     def _on_quit(self, icon, item):
         self.stop_event.set()
         icon.stop()
@@ -602,6 +637,8 @@ class TrayMonitor:
                 pystray.MenuItem("Показать точный заряд", self._on_show_exact),
                 pystray.MenuItem("Синхронизировать время докстанции",
                                   self._on_sync_time_now),
+                pystray.MenuItem("Очистить экран докстанции",
+                                  self._on_clear_screen),
                 pystray.MenuItem("Выход", self._on_quit),
             )
         )
