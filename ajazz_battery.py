@@ -70,7 +70,7 @@ https://qmk.top через браузерный WebHID API (см. README.md, р�
         --threshold N        Порог уведомления о низком заряде, % (по умолчанию 20)
         --sync-interval N    Синхронизация времени раз в N секунд (по умолчанию 3600)
 
-    ajazz_battery.py help | --help | -h | /?
+    ajazz_battery.py help | --help | -h | /? | -? | ?
         Показать это описание.
 
 Примеры:
@@ -86,6 +86,7 @@ import time
 import threading
 import datetime
 import argparse
+import functools
 
 
 # ============================================================================
@@ -193,9 +194,20 @@ def send_clear_screen(h):
 
 
 def send_feature(h, payload):
-    """Отправляет Feature Report с учётом report-id байта, который
-    требует hidapi на Windows."""
-    h.send_feature_report(bytes([0x00]) + payload)
+    """Отправляет Feature Report и проверяет, что hidapi записал его целиком.
+
+    hidapi возвращает число переданных байтов и при некоторых ошибках может
+    вернуть отрицательное значение вместо исключения. Для Feature Report
+    учитывается дополнительный нулевой байт report ID.
+    """
+    report = bytes([0x00]) + payload
+    written = h.send_feature_report(report)
+    if written != len(report):
+        raise OSError(
+            f"HID Feature Report отправлен не полностью: "
+            f"{written}/{len(report)} байт"
+        )
+    return written
 
 
 def read_feature(h, size=REPORT_SIZE):
@@ -217,7 +229,13 @@ def read_status(h):
     if len(resp) < 5:
         return None, None, resp
 
-    # resp[0] -- эхо report-id (0x00) на Windows, дальше идут байты устройства.
+    # Подтверждённый заголовок ответа:
+    # resp[0] -- report ID, resp[1:3] -- два нулевых байта payload.
+    # Не принимаем случайный пакет только потому, что его четвёртый байт
+    # случайно попал в диапазон 0..100.
+    if resp[0:3] != b'\x00\x00\x00':
+        return None, None, resp
+
     percent = resp[3] if resp[3] <= 100 else None
     unknown_byte = resp[4]
     return percent, unknown_byte, resp
@@ -318,6 +336,7 @@ def cmd_sync_time():
 # Команда: monitor
 # ============================================================================
 
+@functools.lru_cache(maxsize=None)
 def _load_font(size):
     """Пробует системные жирные шрифты Windows, иначе -- мелкий
     встроенный шрифт Pillow."""
@@ -422,6 +441,7 @@ class TrayMonitor:
         self.sync_interval = sync_interval
 
         self.state_lock = threading.Lock()
+        self.icon_lock = threading.Lock()
         # hidapi и само устройство не рассчитаны на параллельные команды.
         # Общая блокировка сериализует опрос, синхронизацию и ручные действия.
         self.hid_lock = threading.Lock()
@@ -430,6 +450,9 @@ class TrayMonitor:
         self.percent = None
         self.last_error = None
         self.alerted = False
+        # Версия состояния не даёт потоку мигания перезаписать иконку,
+        # построенную по уже устаревшему проценту.
+        self.state_version = 0
 
         try:
             from plyer import notification as plyer_notification
@@ -454,14 +477,60 @@ class TrayMonitor:
             except Exception as e:
                 print(f"Не удалось показать toast-уведомление: {e}")
 
+    def _set_poll_state(self, percent, error):
+        """Атомарно меняет данные опроса и увеличивает версию состояния."""
+        with self.state_lock:
+            self.percent = percent
+            self.last_error = error
+            self.state_version += 1
+            return self.state_version
+
+    def _state_snapshot(self):
+        with self.state_lock:
+            return self.percent, self.state_version
+
+    def _render_icon_snapshot(self, percent, version, blink_on=True,
+                              update_title=False):
+        """Рисует иконку только если состояние не изменилось за время рендера.
+
+        Pillow и pystray вызываются вне логики HID. Ошибка отрисовки или
+        Windows tray backend не должна завершать фоновые потоки монитора.
+        """
+        if self.stop_event.is_set():
+            return False
+
+        try:
+            image = make_battery_icon(percent, blink_on=blink_on)
+        except Exception as e:
+            print(f"Не удалось сформировать иконку трея: {e}")
+            return False
+
+        try:
+            with self.icon_lock:
+                if self.stop_event.is_set():
+                    return False
+                with self.state_lock:
+                    if (self.state_version != version
+                            or self.percent != percent):
+                        return False
+                    title = (f"AJ159 APEX: {percent}%"
+                             if percent is not None
+                             else "AJ159 APEX: нет данных")
+                    self.icon.icon = image
+                    if update_title:
+                        self.icon.title = title
+            return True
+        except Exception as e:
+            print(f"Не удалось обновить иконку трея: {e}")
+            return False
+
     def _refresh_icon(self):
         if self.stop_event.is_set():
-            return
-        with self.state_lock:
-            p = self.percent
-        self.icon.icon = make_battery_icon(p, blink_on=True)
-        self.icon.title = (f"AJ159 APEX: {p}%" if p is not None
-                            else "AJ159 APEX: нет данных")
+            return False
+        p, version = self._state_snapshot()
+        return self._render_icon_snapshot(
+            p, version, blink_on=True, update_title=True
+        )
 
     # -- опрос заряда ----------------------------------------------------
 
@@ -479,13 +548,9 @@ class TrayMonitor:
                 finally:
                     if h is not None:
                         h.close()
-            with self.state_lock:
-                self.percent = percent
-                self.last_error = None
+            self._set_poll_state(percent, None)
         except Exception as e:
-            with self.state_lock:
-                self.last_error = str(e)
-                self.percent = None
+            self._set_poll_state(None, str(e))
             self._refresh_icon()
             print(f"Ошибка опроса: {e}")
             return
@@ -497,8 +562,10 @@ class TrayMonitor:
             notify = p is not None and p <= self.threshold and not self.alerted
             if notify:
                 self.alerted = True
-            elif p is not None and p > self.threshold + 5:
-                self.alerted = False
+            elif p is not None and p > self.threshold:
+                rearm_level = min(100, self.threshold + 5)
+                if p >= rearm_level:
+                    self.alerted = False
         if notify:
             self._notify("Низкий заряд мыши",
                          f"AJ159 APEX: осталось {p}%. Пора на зарядку.")
@@ -511,13 +578,15 @@ class TrayMonitor:
     def _blink_loop(self):
         blink_on = True
         while not self.stop_event.is_set():
-            with self.state_lock:
-                p = self.percent
+            p, version = self._state_snapshot()
             if _is_blinking_level(p):
-                self.icon.icon = make_battery_icon(p, blink_on=blink_on)
+                self._render_icon_snapshot(
+                    p, version, blink_on=blink_on, update_title=False
+                )
                 blink_on = not blink_on
                 self.stop_event.wait(0.8)
             else:
+                blink_on = True
                 self.stop_event.wait(1.0)
 
     # -- синхронизация времени -------------------------------------------
@@ -534,7 +603,7 @@ class TrayMonitor:
                 finally:
                     if h is not None:
                         h.close()
-            print(f"Время докстанции синхронизировано: "
+            print(f"Команда синхронизации времени отправлена: "
                   f"{now.strftime('%Y-%m-%d %H:%M:%S')}")
             return True
         except Exception as e:
@@ -556,7 +625,7 @@ class TrayMonitor:
             if self.stop_event.is_set():
                 return
             if self._do_sync_time():
-                print("Время повторно синхронизировано после выхода из сна.")
+                print("Команда синхронизации после выхода из сна отправлена.")
                 return
             if attempt < RESUME_SYNC_RETRIES:
                 if self.stop_event.wait(RESUME_SYNC_RETRY_INTERVAL):
@@ -621,7 +690,8 @@ class TrayMonitor:
 
     def _sync_time_manual(self):
         if self._do_sync_time():
-            self._notify("AJ159 APEX", "Время докстанции синхронизировано.")
+            self._notify("AJ159 APEX",
+                         "Команда синхронизации времени отправлена.")
         else:
             self._notify("AJ159 APEX",
                          "Не удалось синхронизировать время докстанции.")
@@ -712,14 +782,22 @@ HELP_ALIASES = {'help', '/?', '-?', '?'}  # argparse уже понимает -h/
 
 
 class _QuietArgumentParser(argparse.ArgumentParser):
-    """При ошибке разбора аргументов (неизвестная команда/флаг) выводит
-    только строку usage, без детального 'invalid choice: ...' и списка
-    допустимых значений -- по вашему пожеланию: любой нераспознанный
-    ввод обрабатывается единообразно, минимальным сообщением."""
+    """При ошибке разбора аргументов выводит только строку usage.
+
+    В frozen-сборке monitor обычно работает без консоли. Если ошибка
+    обнаружена уже после выбора режима monitor, здесь создаётся/подключается
+    консоль, чтобы сообщение не потерялось.
+    """
 
     def error(self, message):
+        allocated_new_console = _ensure_console_for_cli()
         self.print_usage(sys.stderr)
-        sys.exit(2)
+        if allocated_new_console:
+            try:
+                input("\nНажмите Enter для выхода...")
+            except Exception:
+                pass
+        raise SystemExit(2)
 
 
 def _ensure_console_for_cli():
@@ -746,17 +824,234 @@ def _ensure_console_for_cli():
     kernel32 = ctypes.windll.kernel32
     ATTACH_PARENT_PROCESS = -1
 
+    # Функция может вызываться повторно из обработчика ошибки argparse.
+    # Если консоль уже есть, ничего не создаём и не перепривязываем.
+    if kernel32.GetConsoleWindow():
+        return False
+
     attached = kernel32.AttachConsole(ATTACH_PARENT_PROCESS)
     allocated_new = False
     if not attached:
-        kernel32.AllocConsole()
+        if not kernel32.AllocConsole():
+            return False
         allocated_new = True
 
     # После Attach/AllocConsole нужно явно перепривязать stdout/stderr/stdin
     # к дескрипторам консоли -- старые (заглушки) на них не указывают.
-    sys.stdout = open('CONOUT$', 'w', buffering=1)
-    sys.stderr = open('CONOUT$', 'w', buffering=1)
-    sys.stdin = open('CONIN$', 'r')
+    sys.stdout = open('CONOUT
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+
+    # argparse из коробки понимает -h/--help; остальные привычные варианты
+    # запроса помощи добавляем сами.
+    if argv and argv[0] in HELP_ALIASES:
+        argv = ['--help']
+    elif (len(argv) >= 2 and argv[0] == 'monitor'
+          and argv[1] in HELP_ALIASES):
+        argv[1] = '--help'
+
+    # Консоль нужна всем командам, кроме реального запуска monitor.
+    # Ошибки параметров monitor будут при необходимости создавать консоль
+    # через _QuietArgumentParser.error().
+    is_monitor_run = (bool(argv) and argv[0] == 'monitor'
+                       and not any(a in ('-h', '--help') for a in argv[1:]))
+    allocated_new_console = False
+    if not is_monitor_run:
+        allocated_new_console = _ensure_console_for_cli()
+
+    try:
+        parser = _QuietArgumentParser(
+            prog='ajazz_battery',
+            description=__doc__,
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        sub = parser.add_subparsers(dest='command', parser_class=_QuietArgumentParser)
+
+        sub.add_parser('check', help='Разовая проверка заряда')
+        sub.add_parser('sync-time', help='Разовая синхронизация времени докстанции')
+
+        p_monitor = sub.add_parser('monitor', help='Фоновый монитор в трее')
+        p_monitor.add_argument(
+            '--interval', type=int, default=120, metavar='N',
+            help='Интервал опроса заряда в секундах (по умолчанию 120)')
+        p_monitor.add_argument(
+            '--threshold', type=int, default=20, metavar='N',
+            help='Порог уведомления о низком заряде, %% (по умолчанию 20)')
+        p_monitor.add_argument(
+            '--sync-interval', type=int, default=3600, metavar='N',
+            help='Интервал синхронизации времени докстанции в секундах '
+                 '(по умолчанию 3600 = раз в час)')
+
+        args = parser.parse_args(argv)
+        if args.command == 'monitor':
+            if args.interval <= 0 or args.sync_interval <= 0:
+                parser.error("Интервалы должны быть положительными")
+            if not 0 <= args.threshold <= 100:
+                parser.error("Порог должен быть в пределах 0-100")
+
+        if args.command == 'check':
+            cmd_check()
+        elif args.command == 'sync-time':
+            cmd_sync_time()
+        elif args.command == 'monitor':
+            cmd_monitor(args.interval, args.threshold, args.sync_interval)
+        else:
+            parser.print_help()
+    finally:
+        # Если сами создали новое окно консоли (двойной клик по exe) --
+        # без паузы оно закроется мгновенно вместе с процессом, и вывод
+        # прочитать не успеть. Выполняется даже при sys.exit() из парсера.
+        if allocated_new_console:
+            try:
+                input("\nНажмите Enter для выхода...")
+            except Exception:
+                pass
+
+
+if __name__ == '__main__':
+    main()
+, 'w', buffering=1)
+    sys.stderr = open('CONOUT
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+
+    # argparse из коробки понимает -h/--help; остальные привычные варианты
+    # запроса помощи добавляем сами.
+    if argv and argv[0] in HELP_ALIASES:
+        argv = ['--help']
+
+    # Консоль нужна всем командам, кроме реального запуска monitor
+    # (monitor + --help/-h -- это запрос помощи, ему консоль тоже нужна).
+    is_monitor_run = (bool(argv) and argv[0] == 'monitor'
+                       and '-h' not in argv and '--help' not in argv)
+    allocated_new_console = False
+    if not is_monitor_run:
+        allocated_new_console = _ensure_console_for_cli()
+
+    try:
+        parser = _QuietArgumentParser(
+            prog='ajazz_battery',
+            description=__doc__,
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        sub = parser.add_subparsers(dest='command', parser_class=_QuietArgumentParser)
+
+        sub.add_parser('check', help='Разовая проверка заряда')
+        sub.add_parser('sync-time', help='Разовая синхронизация времени докстанции')
+
+        p_monitor = sub.add_parser('monitor', help='Фоновый монитор в трее')
+        p_monitor.add_argument(
+            '--interval', type=int, default=120, metavar='N',
+            help='Интервал опроса заряда в секундах (по умолчанию 120)')
+        p_monitor.add_argument(
+            '--threshold', type=int, default=20, metavar='N',
+            help='Порог уведомления о низком заряде, %% (по умолчанию 20)')
+        p_monitor.add_argument(
+            '--sync-interval', type=int, default=3600, metavar='N',
+            help='Интервал синхронизации времени докстанции в секундах '
+                 '(по умолчанию 3600 = раз в час)')
+
+        args = parser.parse_args(argv)
+        if args.command == 'monitor':
+            if args.interval <= 0 or args.sync_interval <= 0:
+                parser.error("Интервалы должны быть положительными")
+            if not 0 <= args.threshold <= 100:
+                parser.error("Порог должен быть в пределах 0-100")
+
+        if args.command == 'check':
+            cmd_check()
+        elif args.command == 'sync-time':
+            cmd_sync_time()
+        elif args.command == 'monitor':
+            cmd_monitor(args.interval, args.threshold, args.sync_interval)
+        else:
+            parser.print_help()
+    finally:
+        # Если сами создали новое окно консоли (двойной клик по exe) --
+        # без паузы оно закроется мгновенно вместе с процессом, и вывод
+        # прочитать не успеть. Выполняется даже при sys.exit() из парсера.
+        if allocated_new_console:
+            try:
+                input("\nНажмите Enter для выхода...")
+            except Exception:
+                pass
+
+
+if __name__ == '__main__':
+    main()
+, 'w', buffering=1)
+    sys.stdin = open('CONIN
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+
+    # argparse из коробки понимает -h/--help; остальные привычные варианты
+    # запроса помощи добавляем сами.
+    if argv and argv[0] in HELP_ALIASES:
+        argv = ['--help']
+
+    # Консоль нужна всем командам, кроме реального запуска monitor
+    # (monitor + --help/-h -- это запрос помощи, ему консоль тоже нужна).
+    is_monitor_run = (bool(argv) and argv[0] == 'monitor'
+                       and '-h' not in argv and '--help' not in argv)
+    allocated_new_console = False
+    if not is_monitor_run:
+        allocated_new_console = _ensure_console_for_cli()
+
+    try:
+        parser = _QuietArgumentParser(
+            prog='ajazz_battery',
+            description=__doc__,
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        sub = parser.add_subparsers(dest='command', parser_class=_QuietArgumentParser)
+
+        sub.add_parser('check', help='Разовая проверка заряда')
+        sub.add_parser('sync-time', help='Разовая синхронизация времени докстанции')
+
+        p_monitor = sub.add_parser('monitor', help='Фоновый монитор в трее')
+        p_monitor.add_argument(
+            '--interval', type=int, default=120, metavar='N',
+            help='Интервал опроса заряда в секундах (по умолчанию 120)')
+        p_monitor.add_argument(
+            '--threshold', type=int, default=20, metavar='N',
+            help='Порог уведомления о низком заряде, %% (по умолчанию 20)')
+        p_monitor.add_argument(
+            '--sync-interval', type=int, default=3600, metavar='N',
+            help='Интервал синхронизации времени докстанции в секундах '
+                 '(по умолчанию 3600 = раз в час)')
+
+        args = parser.parse_args(argv)
+        if args.command == 'monitor':
+            if args.interval <= 0 or args.sync_interval <= 0:
+                parser.error("Интервалы должны быть положительными")
+            if not 0 <= args.threshold <= 100:
+                parser.error("Порог должен быть в пределах 0-100")
+
+        if args.command == 'check':
+            cmd_check()
+        elif args.command == 'sync-time':
+            cmd_sync_time()
+        elif args.command == 'monitor':
+            cmd_monitor(args.interval, args.threshold, args.sync_interval)
+        else:
+            parser.print_help()
+    finally:
+        # Если сами создали новое окно консоли (двойной клик по exe) --
+        # без паузы оно закроется мгновенно вместе с процессом, и вывод
+        # прочитать не успеть. Выполняется даже при sys.exit() из парсера.
+        if allocated_new_console:
+            try:
+                input("\nНажмите Enter для выхода...")
+            except Exception:
+                pass
+
+
+if __name__ == '__main__':
+    main()
+, 'r')
     return allocated_new
 
 
