@@ -83,9 +83,10 @@ class MonitorTests(unittest.TestCase):
         m = self.monitor()
         m.percent = 80
         h = Mock()
-        with (
-            patch.object(app, 'open_working_device', return_value=(h, {})),
-            patch.object(app, 'read_status', return_value=(None, None, b'')),
+        with patch.object(
+            app, 'open_working_device', return_value=(h, {})
+        ), patch.object(
+            app, 'read_status', return_value=(None, None, b'')
         ):
             m._poll_once()
 
@@ -102,9 +103,10 @@ class MonitorTests(unittest.TestCase):
             self.assertTrue(m.hid_lock.locked())
             raise OSError('disconnected')
 
-        with (
-            patch.object(app, 'open_working_device', return_value=(h, {})),
-            patch.object(app, 'send_clear_screen', side_effect=fail),
+        with patch.object(
+            app, 'open_working_device', return_value=(h, {})
+        ), patch.object(
+            app, 'send_clear_screen', side_effect=fail
         ):
             m._clear_screen_manual()
 
@@ -164,10 +166,8 @@ class MonitorTests(unittest.TestCase):
         m._sync_after_resume.assert_called_once()
 
     def test_cli_invalid_ranges(self):
-        with (
-            patch.object(app, 'cmd_monitor') as start,
-            contextlib.redirect_stderr(io.StringIO()),
-        ):
+        with patch.object(app, 'cmd_monitor') as start, \
+                contextlib.redirect_stderr(io.StringIO()):
             for args in (
                 ['--interval', '0'],
                 ['--sync-interval', '-1'],
@@ -181,12 +181,11 @@ class MonitorTests(unittest.TestCase):
             start.assert_not_called()
 
     def test_cli_monitor_error_requests_console(self):
-        with (
-            patch.object(app, '_ensure_console_for_cli', return_value=False)
-            as ensure_console,
-            patch.object(app, 'cmd_monitor') as start,
-            contextlib.redirect_stderr(io.StringIO()),
-        ):
+        with patch.object(
+            app, '_ensure_console_for_cli', return_value=False
+        ) as ensure_console, patch.object(
+            app, 'cmd_monitor'
+        ) as start, contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as result:
                 app.main(['monitor', '--interval', '0'])
 
@@ -195,10 +194,9 @@ class MonitorTests(unittest.TestCase):
         start.assert_not_called()
 
     def test_monitor_question_help_alias(self):
-        with (
-            patch.object(app, '_ensure_console_for_cli', return_value=False),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
+        with patch.object(
+            app, '_ensure_console_for_cli', return_value=False
+        ), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(SystemExit) as result:
                 app.main(['monitor', '-?'])
 
@@ -206,14 +204,12 @@ class MonitorTests(unittest.TestCase):
 
     def test_cli_handle_closed_on_error(self):
         h = Mock()
-        with (
-            patch.object(app, '_import_hid'),
-            patch.object(
-                app,
-                'open_working_device',
-                return_value=(h, {'path': b'test'}),
-            ),
-            patch.object(app, 'read_status', side_effect=OSError('lost')),
+        with patch.object(app, '_import_hid'), patch.object(
+            app,
+            'open_working_device',
+            return_value=(h, {'path': b'test'}),
+        ), patch.object(
+            app, 'read_status', side_effect=OSError('lost')
         ):
             with self.assertRaises(OSError):
                 app.cmd_check()
@@ -269,10 +265,9 @@ class MonitorTests(unittest.TestCase):
         )
         m._set_poll_state(50, None)
 
-        with (
-            patch.object(app, 'make_battery_icon', return_value=object()),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
+        with patch.object(
+            app, 'make_battery_icon', return_value=object()
+        ), contextlib.redirect_stdout(io.StringIO()):
             self.assertFalse(m._refresh_icon())
 
     def test_high_threshold_alert_can_rearm_at_full_charge(self):
@@ -280,9 +275,10 @@ class MonitorTests(unittest.TestCase):
         m.alerted = True
         h = Mock()
 
-        with (
-            patch.object(app, 'open_working_device', return_value=(h, {})),
-            patch.object(app, 'read_status', return_value=(100, 0, b'')),
+        with patch.object(
+            app, 'open_working_device', return_value=(h, {})
+        ), patch.object(
+            app, 'read_status', return_value=(100, 0, b'')
         ):
             m._poll_once()
 
